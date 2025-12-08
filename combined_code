@@ -1,0 +1,148 @@
+# residual modeling
+
+import pandas as pd
+import numpy as np
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import glob, os
+import matplotlib.pyplot as plt
+
+# SETTINGS
+input_folder = r"C:/Users/anjan/Desktop/task_1/data_sets"
+output_folder = r"C:/Users/anjan/Desktop/task_1/prediction_results_residual"
+os.makedirs(output_folder, exist_ok=True)
+
+file_pattern = "RevenueCenter_*"
+
+LEARNING_RATE = 0.01
+N_ESTIMATORS  = 3000
+MAX_DEPTH     = 5
+RANDOM_STATE  = 42
+
+def mape(y, p):
+    y, p = np.array(y), np.array(p)
+    mask = y != 0
+    return (np.abs((y[mask] - p[mask]) / y[mask]).mean()) * 100
+
+def evaluate(title, y, p):
+    print(f"\n{title}")
+    print(f"  MAE  : {mean_absolute_error(y, p):.2f}")
+    print(f"  RMSE : {np.sqrt(mean_squared_error(y, p)):.2f}")
+    print(f"  R²   : {r2_score(y, p):.3f}")
+    print(f"  MAPE : {mape(y, p):.2f}%")
+
+# MAIN LOOP
+files = glob.glob(os.path.join(input_folder, file_pattern + ".xlsx"))
+
+for file in files:
+    center_name = os.path.basename(file).split(".xlsx")[0]
+    print("\n" + "="*100)
+    print(f"Processing → {center_name}")
+
+    df = pd.read_excel(file)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").dropna().reset_index(drop=True)
+
+    train_df = df[df["Date"] < "2024-01-01"]
+    val_df   = df[(df["Date"] >= "2024-01-01") & (df["Date"] <= "2024-02-29")]
+    test_df  = df[(df["Date"] >= "2024-03-01") & (df["Date"] <= "2024-04-30")]
+
+    if train_df.empty or val_df.empty or test_df.empty:
+        print("Not enough data ")
+        continue
+
+    feature_cols = [
+        "average_temperature", "weather_code",
+        "Day_Monday","Day_Tuesday","Day_Wednesday","Day_Thursday",
+        "Day_Friday","Day_Saturday","Day_Sunday",
+        "IsWeekend", "IsHoliday",
+    ]
+
+    X_train = train_df[feature_cols]
+    X_val   = val_df[feature_cols]
+    X_test  = test_df[feature_cols]
+
+    meals = ["BreakFast", "Lunch", "Dinner"]
+    predictions = {}
+
+    for meal in meals:
+        print(f"\nTraining → {meal}")
+
+        y_train = train_df[meal]
+        y_val   = val_df[meal]
+        y_test  = test_df[meal]
+
+        # BASE MODEL
+        base_model = XGBRegressor(
+            n_estimators=N_ESTIMATORS,
+            learning_rate=LEARNING_RATE,
+            max_depth=MAX_DEPTH,
+            random_state=RANDOM_STATE,
+            eval_metric="rmse"
+        )
+        base_model.fit(X_train, y_train)
+
+        val_base_pred  = base_model.predict(X_val)
+        test_base_pred = base_model.predict(X_test)
+
+        # RESIDUAL MODEL
+        train_residuals = y_train - base_model.predict(X_train)
+
+        residual_model = XGBRegressor(
+            n_estimators=300,
+            learning_rate=0.1,
+            max_depth=3,
+            random_state=RANDOM_STATE,
+            eval_metric="rmse"
+        )
+        residual_model.fit(X_train, train_residuals)
+
+        val_residual_pred  = residual_model.predict(X_val)
+        test_residual_pred = residual_model.predict(X_test)
+
+        # FINAL PREDICTIONS
+        val_final_pred  = val_base_pred + val_residual_pred
+        test_final_pred = test_base_pred + test_residual_pred
+
+        evaluate(f"{meal} Validation (Residual)", y_val, val_final_pred)
+        evaluate(f"{meal} Test (Residual)", y_test, test_final_pred)
+
+        predictions[meal] = test_final_pred
+
+    # CREATE RESULT TABLE
+    result = pd.DataFrame({
+        "Date": test_df["Date"],
+        "Actual_BreakFast": test_df["BreakFast"],
+        "Pred_BreakFast": predictions["BreakFast"],
+        "Actual_Lunch": test_df["Lunch"],
+        "Pred_Lunch": predictions["Lunch"],
+        "Actual_Dinner": test_df["Dinner"],
+        "Pred_Dinner": predictions["Dinner"]
+    })
+
+    print("\n🔍 Preview of Prediction Results:")
+    display(result.head())
+    display(result.tail())
+
+    # PLOTS
+    for meal in meals:
+        y_test = test_df[meal]
+        test_pred = predictions[meal]
+
+        plt.figure(figsize=(10,5))
+        plt.plot(test_df["Date"], y_test, label="Actual", linewidth=2)
+        plt.plot(test_df["Date"], test_pred, label="Predicted", linewidth=2)
+        plt.title(f"{center_name} - {meal} Forecast (Residual Model)")
+        plt.xlabel("Date")
+        plt.ylabel("Revenue")
+        plt.legend()
+        plt.grid(True)
+
+        plot_path = os.path.join(output_folder, f"{center_name}_{meal}_residual_plot.png")
+        plt.savefig(plot_path, dpi=300)
+        plt.show()
+        plt.close()
+
+    print(f" Saved residual plots to: {output_folder}")
+
+print("\n All Revenue Centers Completed!")
